@@ -156,6 +156,9 @@ class NiFiClient:
         group_name = path[-1] if path else \
             pgf.get("breadcrumb", {}).get("breadcrumb", {}).get("name", "")
         for proc in flow.get("processors", []):
+            # Ignore disabled processors (state == "DISABLED").
+            if (proc.get("component") or {}).get("state") == "DISABLED":
+                continue
             yield proc, group_name, path
         for child in flow.get("processGroups", []):
             child_name = (child.get("component") or {}).get("name", "")
