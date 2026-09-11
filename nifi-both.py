@@ -36,6 +36,7 @@ Usage:
 
 import argparse
 import csv
+import re
 import sys
 
 import requests
@@ -71,6 +72,54 @@ def first_prop(props, keys):
     return ""
 
 
+# --- factory inference -------------------------------------------------------
+
+# Site codes look like: 2 letters + a digit + one alphanumeric.
+# Matches RO03, SR08, IE75, MX37, CH5F, CH15, ...
+SITE_CODE_RE = re.compile(r"^[A-Z]{2}\d[A-Z0-9]$")
+
+# City-name factories can't be inferred by shape, so we match a known set.
+# Seeded with the given examples; extend at runtime with --extra-cities.
+DEFAULT_CITIES = {
+    "Mexicali", "Bucharest", "Wuhan", "Presov", "Pune",
+}
+
+
+def infer_factory(path, cities):
+    """
+    Infer the factory name from a process-group ancestry path.
+
+    path   : list of group names from the top of the tree (root's direct
+             child) down to the processor's immediate group. Root excluded.
+    cities : set of known city-name factories.
+
+    Strategy: scan the path from the top of the tree downward (factories
+    normally sit high in the hierarchy) and return the first segment that
+    either matches the site-code pattern or is a known city. A second pass
+    also checks individual words within a segment, so decorated names like
+    "RO03 - SMT Line" or "Bucharest Plant 2" still resolve.
+    """
+    city_lookup = {c.lower(): c for c in cities}
+
+    # Pass 1: whole segment is the factory.
+    for seg in path:
+        token = seg.strip()
+        if SITE_CODE_RE.match(token):
+            return token
+        if token.lower() in city_lookup:
+            return city_lookup[token.lower()]
+
+    # Pass 2: factory appears as a word inside a decorated segment name.
+    for seg in path:
+        for word in re.split(r"[\s_\-/|]+", seg.strip()):
+            if SITE_CODE_RE.match(word):
+                return word
+            if word.lower() in city_lookup:
+                return city_lookup[word.lower()]
+
+    return ""
+
+
 # --- NiFi API client (HTTP Basic auth, terminated by HAProxy) ----------------
 
 class NiFiClient:
@@ -90,35 +139,48 @@ class NiFiClient:
     def root_id(self):
         return self._get("/flow/process-groups/root")["processGroupFlow"]["id"]
 
-    def processors(self, pg_id=None):
-        """Yield (processor entity, parent group name), recursing nested groups."""
+    def processors(self, pg_id=None, path=None):
+        """
+        Yield (processor entity, parent group name, ancestry path).
+
+        `path` is the list of group names from the top of the tree (root's
+        direct child) down to and including the current group; root is
+        excluded, so processors sitting directly in root have an empty path.
+        """
+        if path is None:
+            path = []
         if pg_id is None:
             pg_id = self.root_id()
         pgf = self._get(f"/flow/process-groups/{pg_id}")["processGroupFlow"]
-        group_name = pgf.get("breadcrumb", {}).get("breadcrumb", {}).get("name", "")
         flow = pgf["flow"]
+        # Immediate parent name: last path element, or the root's own name.
+        group_name = path[-1] if path else \
+            pgf.get("breadcrumb", {}).get("breadcrumb", {}).get("name", "")
         for proc in flow.get("processors", []):
-            yield proc, group_name
+            yield proc, group_name, path
         for child in flow.get("processGroups", []):
-            yield from self.processors(child["id"])
+            child_name = (child.get("component") or {}).get("name", "")
+            yield from self.processors(child["id"], path + [child_name])
 
 
 # --- extraction --------------------------------------------------------------
 
-def collect(client):
+def collect(client, cities):
     sftp_rows, sql_rows = [], []
-    for proc, group_name in client.processors():
+    for proc, group_name, path in client.processors():
         comp = proc.get("component", {})
         ptype = comp.get("type", "")
         name = comp.get("name", "")
         uid = comp.get("id") or proc.get("id", "")
         props = (comp.get("config") or {}).get("properties") or {}
+        factory = infer_factory(path, cities)
 
         if ptype in SFTP_TYPES:
             sftp_rows.append({
                 "name": name,
                 "type": ptype.rsplit(".", 1)[-1],
                 "parent_group": group_name,
+                "factory": factory,
                 "uid": uid,
                 "hostname": first_prop(props, HOSTNAME_KEYS),
             })
@@ -127,6 +189,7 @@ def collect(client):
                 "name": name,
                 "type": ptype.rsplit(".", 1)[-1],
                 "parent_group": group_name,
+                "factory": factory,
                 "uid": uid,
                 "where": first_prop(props, WHERE_KEYS),
             })
@@ -139,28 +202,30 @@ def print_report(sftp_rows, sql_rows):
     print(f"\n=== ListSFTP sources ({len(sftp_rows)}) ===")
     for r in sftp_rows:
         print(f"  {r['name']}")
-        print(f"      group: {r['parent_group'] or '(root)'}")
-        print(f"      uid  : {r['uid']}")
-        print(f"      host : {r['hostname'] or '(not set)'}")
+        print(f"      factory: {r['factory'] or '(unknown)'}")
+        print(f"      group  : {r['parent_group'] or '(root)'}")
+        print(f"      uid    : {r['uid']}")
+        print(f"      host   : {r['hostname'] or '(not set)'}")
 
     print(f"\n=== SQL sources ({len(sql_rows)}) ===")
     for r in sql_rows:
         print(f"  {r['name']}  [{r['type']}]")
-        print(f"      group: {r['parent_group'] or '(root)'}")
-        print(f"      uid  : {r['uid']}")
-        print(f"      where: {r['where'] or '(none)'}")
+        print(f"      factory: {r['factory'] or '(unknown)'}")
+        print(f"      group  : {r['parent_group'] or '(root)'}")
+        print(f"      uid    : {r['uid']}")
+        print(f"      where  : {r['where'] or '(none)'}")
 
 
 def print_csv(sftp_rows, sql_rows):
     w = csv.writer(sys.stdout)
-    w.writerow(["category", "name", "type", "parent_group", "uid",
+    w.writerow(["category", "name", "type", "parent_group", "factory", "uid",
                 "detail_key", "detail_value"])
     for r in sftp_rows:
-        w.writerow(["sftp", r["name"], r["type"], r["parent_group"], r["uid"],
-                    "hostname", r["hostname"]])
+        w.writerow(["sftp", r["name"], r["type"], r["parent_group"],
+                    r["factory"], r["uid"], "hostname", r["hostname"]])
     for r in sql_rows:
-        w.writerow(["sql", r["name"], r["type"], r["parent_group"], r["uid"],
-                    "where", r["where"]])
+        w.writerow(["sql", r["name"], r["type"], r["parent_group"],
+                    r["factory"], r["uid"], "where", r["where"]])
 
 
 def main():
@@ -172,11 +237,18 @@ def main():
     ap.add_argument("--password", help="HTTP Basic password (HAProxy)")
     ap.add_argument("--verify", action="store_true", help="Verify TLS certificates")
     ap.add_argument("--format", choices=["text", "csv"], default="text")
+    ap.add_argument("--extra-cities",
+                    help="Comma-separated extra city-name factories to recognise, "
+                         "e.g. 'Guadalajara,Timisoara'")
     args = ap.parse_args()
+
+    cities = set(DEFAULT_CITIES)
+    if args.extra_cities:
+        cities.update(c.strip() for c in args.extra_cities.split(",") if c.strip())
 
     client = NiFiClient(args.url, args.user, args.password, verify=args.verify)
     try:
-        sftp_rows, sql_rows = collect(client)
+        sftp_rows, sql_rows = collect(client, cities)
     except requests.HTTPError as e:
         # 401 here almost always means the HAProxy basic-auth credentials were
         # missing or wrong.
