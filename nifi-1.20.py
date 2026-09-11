@@ -8,6 +8,7 @@ NiFi REST API and report:
   * ListSFTP processors            -> processor name + remote Hostname
   * SQL table-fetch processors     -> processor name + WHERE filter clause
     (QueryDatabaseTable, QueryDatabaseTableRecord, GenerateTableFetch)
+  * InvokeHTTP processors          -> processor name + request URL
 
 The script walks every process group starting at the root, so processors
 nested inside child groups are included too.
@@ -51,9 +52,16 @@ SQL_TYPES = {
     "org.apache.nifi.processors.standard.GenerateTableFetch",
 }
 
+HTTP_TYPES = {
+    "org.apache.nifi.processors.standard.InvokeHTTP",
+}
+
 # Property KEYS as they appear in NiFi's properties map (not the UI display name).
 HOSTNAME_KEYS = ("Hostname",)
 WHERE_KEYS = ("db-fetch-where-clause",)
+# InvokeHTTP URL: "HTTP URL" since the 1.16 refactor; "Remote URL" on flows
+# migrated from older versions.
+URL_KEYS = ("HTTP URL", "Remote URL")
 
 
 def first_prop(props, keys):
@@ -160,28 +168,38 @@ class NiFiClient:
     def root_id(self):
         return self._get("/flow/process-groups/root")["processGroupFlow"]["id"]
 
-    def processors(self, pg_id=None):
+    def processors(self, pg_id=None, descent=None):
         """
         Yield (processor entity, parent group name, ancestry path).
 
-        `path` is the full list of group names from root down to and
-        including the processor's own group, derived from the group's
-        breadcrumb chain so it does not depend on child component names or
-        on read permissions of intermediate groups.
+        The ancestry path spans the whole tree from root down to the
+        processor's own group. It is assembled from TWO sources and merged,
+        so a factory name is found even if one source is empty:
+          * the group's breadcrumb chain (root -> current), and
+          * the child group names collected while descending.
         """
+        if descent is None:
+            descent = []
         if pg_id is None:
             pg_id = self.root_id()
         pgf = self._get(f"/flow/process-groups/{pg_id}")["processGroupFlow"]
         flow = pgf["flow"]
-        path = self._breadcrumb_path(pgf)
+
+        crumb = self._breadcrumb_path(pgf)
+        path = []
+        for name in list(crumb) + list(descent):
+            if name and name not in path:
+                path.append(name)
         group_name = path[-1] if path else ""
+
         for proc in flow.get("processors", []):
             # Ignore disabled processors (state == "DISABLED").
             if (proc.get("component") or {}).get("state") == "DISABLED":
                 continue
             yield proc, group_name, path
         for child in flow.get("processGroups", []):
-            yield from self.processors(child["id"])
+            child_name = (child.get("component") or {}).get("name", "")
+            yield from self.processors(child["id"], descent + [child_name])
 
     @staticmethod
     def _breadcrumb_path(pgf):
@@ -199,8 +217,8 @@ class NiFiClient:
 
 # --- extraction --------------------------------------------------------------
 
-def collect(client, cities):
-    sftp_rows, sql_rows = [], []
+def collect(client, cities, debug=False):
+    sftp_rows, sql_rows, http_rows = [], [], []
     for proc, group_name, path in client.processors():
         comp = proc.get("component", {})
         ptype = comp.get("type", "")
@@ -208,6 +226,10 @@ def collect(client, cities):
         uid = comp.get("id") or proc.get("id", "")
         props = (comp.get("config") or {}).get("properties") or {}
         factory = infer_factory(path, cities)
+
+        if debug and ptype in (SFTP_TYPES | SQL_TYPES | HTTP_TYPES):
+            print(f"[debug] {name!r} factory={factory!r} path={path}",
+                  file=sys.stderr)
 
         if ptype in SFTP_TYPES:
             sftp_rows.append({
@@ -227,12 +249,21 @@ def collect(client, cities):
                 "uid": uid,
                 "where": first_prop(props, WHERE_KEYS),
             })
-    return sftp_rows, sql_rows
+        elif ptype in HTTP_TYPES:
+            http_rows.append({
+                "name": name,
+                "type": ptype.rsplit(".", 1)[-1],
+                "parent_group": group_name,
+                "factory": factory,
+                "uid": uid,
+                "url": first_prop(props, URL_KEYS),
+            })
+    return sftp_rows, sql_rows, http_rows
 
 
 # --- output ------------------------------------------------------------------
 
-def print_report(sftp_rows, sql_rows):
+def print_report(sftp_rows, sql_rows, http_rows):
     print(f"\n=== ListSFTP sources ({len(sftp_rows)}) ===")
     for r in sftp_rows:
         print(f"  {r['name']}")
@@ -249,8 +280,16 @@ def print_report(sftp_rows, sql_rows):
         print(f"      uid    : {r['uid']}")
         print(f"      where  : {r['where'] or '(none)'}")
 
+    print(f"\n=== InvokeHTTP sources ({len(http_rows)}) ===")
+    for r in http_rows:
+        print(f"  {r['name']}")
+        print(f"      factory: {r['factory'] or '(unknown)'}")
+        print(f"      group  : {r['parent_group'] or '(root)'}")
+        print(f"      uid    : {r['uid']}")
+        print(f"      url    : {r['url'] or '(not set)'}")
 
-def print_csv(sftp_rows, sql_rows):
+
+def print_csv(sftp_rows, sql_rows, http_rows):
     w = csv.writer(sys.stdout)
     w.writerow(["category", "name", "type", "parent_group", "factory", "uid",
                 "detail_key", "detail_value"])
@@ -260,6 +299,9 @@ def print_csv(sftp_rows, sql_rows):
     for r in sql_rows:
         w.writerow(["sql", r["name"], r["type"], r["parent_group"],
                     r["factory"], r["uid"], "where", r["where"]])
+    for r in http_rows:
+        w.writerow(["http", r["name"], r["type"], r["parent_group"],
+                    r["factory"], r["uid"], "url", r["url"]])
 
 
 def main():
@@ -274,6 +316,8 @@ def main():
     ap.add_argument("--extra-cities",
                     help="Comma-separated extra city-name factories to recognise, "
                          "e.g. 'Guadalajara,Timisoara'")
+    ap.add_argument("--debug", action="store_true",
+                    help="Print each matched processor's group path to stderr")
     args = ap.parse_args()
 
     cities = set(DEFAULT_CITIES)
@@ -283,16 +327,16 @@ def main():
     client = NiFiClient(args.url, args.user, args.password, args.token,
                         verify=args.verify)
     try:
-        sftp_rows, sql_rows = collect(client, cities)
+        sftp_rows, sql_rows, http_rows = collect(client, cities, debug=args.debug)
     except requests.HTTPError as e:
         sys.exit(f"NiFi API error: {e}")
     except requests.RequestException as e:
         sys.exit(f"Connection error: {e}")
 
     if args.format == "csv":
-        print_csv(sftp_rows, sql_rows)
+        print_csv(sftp_rows, sql_rows, http_rows)
     else:
-        print_report(sftp_rows, sql_rows)
+        print_report(sftp_rows, sql_rows, http_rows)
 
 
 if __name__ == "__main__":
