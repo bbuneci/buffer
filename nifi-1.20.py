@@ -67,8 +67,9 @@ def first_prop(props, keys):
 # --- factory inference -------------------------------------------------------
 
 # Site codes look like: 2 letters + a digit + one alphanumeric.
-# Matches RO03, SR08, IE75, MX37, CH5F, CH15, ...
-SITE_CODE_RE = re.compile(r"^[A-Z]{2}\d[A-Z0-9]$")
+# Matches RO03, SR08, IE75, MX37, CH5F, CH15, ... (case-insensitive).
+SITE_CODE_RE = re.compile(r"[A-Za-z]{2}\d[A-Za-z0-9]")
+_SEP_RE = re.compile(r"[\s_\-/|.,:]+")
 
 # City-name factories can't be inferred by shape, so we match a known set.
 # Seeded with the given examples; extend at runtime with --extra-cities.
@@ -79,35 +80,56 @@ DEFAULT_CITIES = {
 
 def infer_factory(path, cities):
     """
-    Infer the factory name from a process-group ancestry path.
+    Infer the factory name from a process-group ancestry path (the whole tree
+    from root down to the processor's group, not just the immediate parent).
 
-    path   : list of group names from the top of the tree (root's direct
-             child) down to the processor's immediate group. Root excluded.
+    path   : list of group names, root first.
     cities : set of known city-name factories.
 
-    Strategy: scan the path from the top of the tree downward (factories
-    normally sit high in the hierarchy) and return the first segment that
-    either matches the site-code pattern or is a known city. A second pass
-    also checks individual words within a segment, so decorated names like
-    "RO03 - SMT Line" or "Bucharest Plant 2" still resolve.
+    Matching runs in order of confidence:
+      1. a whole segment is exactly a site code or a known city;
+      2. a word inside a decorated segment ("RO03 - SMT", "Bucharest Plant 2");
+      3. a site code / city found as a substring anywhere in a segment.
+    Site codes are matched case-insensitively and returned upper-cased.
     """
     city_lookup = {c.lower(): c for c in cities}
 
-    # Pass 1: whole segment is the factory.
-    for seg in path:
-        token = seg.strip()
-        if SITE_CODE_RE.match(token):
-            return token
-        if token.lower() in city_lookup:
-            return city_lookup[token.lower()]
+    def as_city(token):
+        return city_lookup.get(token.lower())
 
-    # Pass 2: factory appears as a word inside a decorated segment name.
+    def as_code(token):
+        return token.upper() if SITE_CODE_RE.fullmatch(token) else None
+
+    # Pass 1: whole segment.
     for seg in path:
-        for word in re.split(r"[\s_\-/|]+", seg.strip()):
-            if SITE_CODE_RE.match(word):
-                return word
-            if word.lower() in city_lookup:
-                return city_lookup[word.lower()]
+        seg = (seg or "").strip()
+        if not seg:
+            continue
+        if (c := as_code(seg)):
+            return c
+        if (c := as_city(seg)):
+            return c
+
+    # Pass 2: word within a decorated segment.
+    for seg in path:
+        for word in _SEP_RE.split((seg or "").strip()):
+            if not word:
+                continue
+            if (c := as_code(word)):
+                return c
+            if (c := as_city(word)):
+                return c
+
+    # Pass 3: substring anywhere (last resort).
+    for seg in path:
+        seg = seg or ""
+        low = seg.lower()
+        for c_low, c in city_lookup.items():
+            if c_low in low:
+                return c
+        mo = re.search(r"\b[A-Za-z]{2}\d[A-Za-z0-9]\b", seg)
+        if mo:
+            return mo.group(0).upper()
 
     return ""
 
