@@ -138,31 +138,41 @@ class NiFiClient:
     def root_id(self):
         return self._get("/flow/process-groups/root")["processGroupFlow"]["id"]
 
-    def processors(self, pg_id=None, path=None):
+    def processors(self, pg_id=None):
         """
         Yield (processor entity, parent group name, ancestry path).
 
-        `path` is the list of group names from the top of the tree (root's
-        direct child) down to and including the current group; root is
-        excluded, so processors sitting directly in root have an empty path.
+        `path` is the full list of group names from root down to and
+        including the processor's own group, derived from the group's
+        breadcrumb chain so it does not depend on child component names or
+        on read permissions of intermediate groups.
         """
-        if path is None:
-            path = []
         if pg_id is None:
             pg_id = self.root_id()
         pgf = self._get(f"/flow/process-groups/{pg_id}")["processGroupFlow"]
         flow = pgf["flow"]
-        # Immediate parent name: last path element, or the root's own name.
-        group_name = path[-1] if path else \
-            pgf.get("breadcrumb", {}).get("breadcrumb", {}).get("name", "")
+        path = self._breadcrumb_path(pgf)
+        group_name = path[-1] if path else ""
         for proc in flow.get("processors", []):
             # Ignore disabled processors (state == "DISABLED").
             if (proc.get("component") or {}).get("state") == "DISABLED":
                 continue
             yield proc, group_name, path
         for child in flow.get("processGroups", []):
-            child_name = (child.get("component") or {}).get("name", "")
-            yield from self.processors(child["id"], path + [child_name])
+            yield from self.processors(child["id"])
+
+    @staticmethod
+    def _breadcrumb_path(pgf):
+        """Flatten a processGroupFlow breadcrumb chain into [root, ..., current]."""
+        names = []
+        bc = pgf.get("breadcrumb")
+        while bc:
+            name = (bc.get("breadcrumb") or {}).get("name")
+            if name:
+                names.append(name)
+            bc = bc.get("parentBreadcrumb")
+        names.reverse()  # breadcrumb chains child -> parent; we want root first
+        return names
 
 
 # --- extraction --------------------------------------------------------------
